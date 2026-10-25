@@ -9,7 +9,7 @@
 
 ## 1. Summary
 
-Add a public, read-only endpoint that returns every House Council Nilgiri has had, grouped by academic year and team. The data comes from the existing `council_members` table, using its `tenure_year` column as the axis of history: a member's row is never deleted when their term ends, it simply stops being the current year. The 2025-26 council, which today exists only as a static YAML file, is backfilled into the table so the history is complete and editable from the admin panel.
+Add a public, read-only endpoint that returns every **past** House Council Nilgiri has had, grouped by academic year and team. Past members are identified by roll number, which is resolved from their IITM email; their emails are never published. The data comes from the existing `council_members` table, using its `tenure_year` column as the axis of history: a member's row is never deleted when their term ends, it simply stops being the current year. The 2025-26 council, which today exists only as a static YAML file, is backfilled into the table so the history is complete and editable from the admin panel.
 
 ## 2. Background: how council data works today
 
@@ -44,17 +44,18 @@ Add a public, read-only endpoint that returns every House Council Nilgiri has ha
 | P5 | Dirty text | Live `position` values include trailing spaces (`"Regional Coordinator "`) | Sorting/grouping quirks |
 | P6 | `sync-yaml` dumps every row | Both implementations select `*` with no filter | After backfill, the "current council" fallback YAML would contain past councils |
 | P7 | Route shadowing | Vercel router (`api/index.ts`) sends any `/api/council/<x>` to the `[id]` handler; Express registers `GET /:id` before other GETs | A naive `/api/council/history` is treated as a member ID and returns 404/500 |
+| P8 | Past members' emails would go public | `GET /api/council`, `/api/council/:id` and `/api/council/team/:team` all `select('*')` with no auth | Once past councils are in the table, anyone can download every former member's email |
 
 ## 3. Goals and non-goals
 
 ### Goals
 
-1. One endpoint that returns the full council history, newest year first, grouped into the same teams the UI shows.
+1. One endpoint that returns every past council (all years before the current one), newest first, grouped into the same teams the UI shows.
 2. Filter by year and team, and a lightweight summary mode for the year picker.
 3. History is maintained from the admin panel: ending a term needs no data copying, just entering the next council with the next `tenure_year`.
 4. Backfill 2025-26 with permanent photo URLs before 2027-01-19.
 5. Same behaviour on both backends (Vercel `api/` and Express `backend/`), matching how every other endpoint is maintained today.
-6. No personal contact details (email) in the public history.
+6. On every public endpoint, past members are identified by roll number and never by email. Current members' emails stay public, as today.
 
 ### Non-goals
 
@@ -78,12 +79,12 @@ Add a public, read-only endpoint that returns every House Council Nilgiri has ha
           ┌─────────────────────────┼──────────────────────────────┐
           ▼                         ▼                              ▼
  GET /api/council?          GET /api/council/history       POST /api/council/sync-yaml
-   tenure_year=current        (all years, grouped)           (current year only)
+   tenure_year=current        (past years, grouped)          (current year only)
           │                         │
    /council page              /council/archive page
 ```
 
-Why this over alternatives is covered in [§13](#13-alternatives-considered). In short: the admin panel, API and table already carry `tenure_year`; the only missing pieces are a year filter on the current-council query, a grouped read endpoint, clean team values, and the backfill.
+Why this over alternatives is covered in [§13](#13-alternatives-considered). In short: the admin panel, API and table already carry `tenure_year`; the only missing pieces are a year filter on the current-council query, a grouped read endpoint, clean team values, a roll-number field, and the backfill.
 
 ## 5. Data model changes
 
@@ -107,6 +108,10 @@ WHERE lower(btrim(coalesce(team, ''))) NOT IN (
 -- Name of the existing team CHECK, if any (expected: council_members_team_check)
 SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
 WHERE conrelid = 'council_members'::regclass AND contype = 'c';
+
+-- Review, not a blocker: emails that aren't IITM student addresses get roll_no = NULL (§5.4)
+SELECT id, name, email FROM council_members
+WHERE email IS NOT NULL AND btrim(email) !~* '^[^@]+@([a-z]+\.)?study\.iitm\.ac\.in$';
 ```
 
 ### 5.2 Migration
@@ -148,6 +153,15 @@ ALTER TABLE council_members DROP CONSTRAINT IF EXISTS council_members_unique_ter
 ALTER TABLE council_members ADD CONSTRAINT council_members_unique_term
   UNIQUE (tenure_year, team, name, position);
 
+-- Roll number, resolved from the IITM email: 22f1000000@ds.study.iitm.ac.in → 22f1000000.
+-- Stored for every member; NULL when there's no email or it isn't an IITM student address.
+ALTER TABLE council_members ADD COLUMN IF NOT EXISTS roll_no TEXT
+  GENERATED ALWAYS AS (
+    CASE WHEN btrim(email) ~* '^[^@]+@([a-z]+\.)?study\.iitm\.ac\.in$'
+         THEN lower(split_part(btrim(email), '@', 1))
+    END
+  ) STORED;
+
 CREATE INDEX IF NOT EXISTS idx_council_members_tenure_team
   ON council_members (tenure_year DESC, team);
 
@@ -155,6 +169,8 @@ COMMENT ON COLUMN council_members.tenure_year IS
   'First calendar year of the academic-year term: 2025 = 2025-26';
 COMMENT ON COLUMN council_members.team IS
   'UHC, Operations (Multimedia/PR/WebOps), RC, Community Admins or Mentors';
+COMMENT ON COLUMN council_members.roll_no IS
+  'Generated: part of an IITM student email before @, lowercased; NULL otherwise';
 
 COMMIT;
 ```
@@ -179,15 +195,28 @@ Display order everywhere: UHC → Operations → RC → Community Admins → Men
 
 Sub-team order: Multimedia → PR → WebOps (as today).
 
+### 5.4 Roll number
+
+`roll_no` is a stored generated column. Postgres resolves it from `email` on every insert and update, so every member has one, current and past, and nobody types it in. It is the part of the email before `@`, lowercased:
+
+| `email` | `roll_no` |
+|---|---|
+| `22F1000000@ds.study.iitm.ac.in` | `22f1000000` |
+| `21f1000000@es.study.iitm.ac.in` | `21f1000000` |
+| `first.last@gmail.com` | `NULL` |
+| `NULL` | `NULL` |
+
+It is only resolved for IITM student addresses (`…study.iitm.ac.in`). Without that check, a personal address would publish its username as a "roll number". The admin form doesn't change, and the column can't be written directly: to change a roll number, change the email.
+
 ## 6. API: `GET /api/council/history`
 
-Public, no authentication, read-only.
+Public, no authentication, read-only. Returns **past** councils only: every `tenure_year` below the current one. The current council stays on `GET /api/council` (decided; the archive page lists past years only).
 
 ### 6.1 Query parameters
 
 | Param | Type | Example | Behaviour |
 |---|---|---|---|
-| `year` | `YYYY` or `YYYY-YY` | `2025`, `2025-26` | Return only that tenure. `YYYY-YY` must be consecutive years (`2025-27` → 400). Unknown year → 404. |
+| `year` | `YYYY` or `YYYY-YY` | `2025`, `2025-26` | Return only that tenure. `YYYY-YY` must be consecutive years (`2025-27` → 400). Unknown year, or the current year → 404. |
 | `team` | canonical team or legacy alias | `UHC`, `mentor` | Only that team inside each tenure. Unknown team → 400. Tenures with no members in that team are omitted. |
 | `summary` | `true` | `true` | Omit `teams`/members; return counts only. Used to build the year picker cheaply. |
 
@@ -200,43 +229,38 @@ Unknown parameters are ignored.
   "current_tenure_year": 2026,
   "tenures": [
     {
-      "tenure_year": 2026,
-      "label": "2026-27",
-      "is_current": true,
-      "member_count": 6,
+      "tenure_year": 2025,
+      "label": "2025-26",
+      "member_count": 24,
       "teams": [
         {
-          "key": "RC",
-          "label": "RC",
+          "key": "UHC",
+          "label": "UHC",
           "members": [
             {
               "id": "6f1c…",
               "name": "Member Name",
-              "position": "Regional Coordinator",
+              "roll_no": "22f1000000",
+              "position": "Secretary",
               "region": "Kolkata",
               "sub_team": null,
               "profile_photo_url": "https://<project>.supabase.co/storage/v1/object/public/nilgiri_media/…",
               "linkedin": "https://www.linkedin.com/in/…"
             }
           ]
-        }
+        },
+        { "key": "Operations", "label": "Multimedia/PR/WebOps", "members": [ … ] }
       ]
     },
-    {
-      "tenure_year": 2025,
-      "label": "2025-26",
-      "is_current": false,
-      "member_count": 24,
-      "teams": [ { "key": "UHC", "label": "UHC", "members": [ … ] }, … ]
-    }
+    { "tenure_year": 2024, "label": "2024-25", "member_count": 21, "teams": [ … ] }
   ]
 }
 ```
 
-- `tenures` is ordered newest first. It **includes the current tenure**, flagged `is_current`, so one endpoint serves both "archive" and "all-time" views; the client decides whether to hide it.
+- `tenures` holds past years only, newest first. `current_tenure_year` tells the client which year was left out; that year's council is what `/api/council?tenure_year=current` returns.
 - `teams` is an ordered array (not an object) so the display order travels with the data. Empty teams are omitted.
 - `summary=true` returns the same shape without `teams`.
-- `current_tenure_year` is `null` and `tenures` is `[]` when the table is empty.
+- `tenures` is `[]` when only the current council exists. `current_tenure_year` is `null` when the table is empty.
 - `label` is `` `${y}-${String((y + 1) % 100).padStart(2, '0')}` ``.
 
 ### 6.3 Member fields
@@ -247,13 +271,14 @@ Explicit column list. Never `select('*')`.
 |---|---|---|
 | `id` | `id` | Stable key for React lists and future deep links |
 | `name` | `name` | |
+| `roll_no` | `roll_no` (generated, [§5.4](#54-roll-number)) | `null` if no IITM email is on record |
 | `position` | `position` | Trimmed |
 | `region` | `region` | `null` if empty |
 | `sub_team` | derived | `Multimedia` / `PR` / `WebOps` for `Operations`, else `null` |
 | `profile_photo_url` | `profile_photo_url` | `null` if empty |
 | `linkedin` | `linkedin` | `null` if empty |
 
-**Excluded on purpose:** `email` (contact details of former students should not be published indefinitely), `created_at`, `updated_at`.
+**Excluded on purpose:** `email` (decided: former members are identified by roll number only), `created_at`, `updated_at`.
 
 ### 6.4 Sorting inside a team
 
@@ -270,6 +295,7 @@ All errors are JSON `{ "error": "<message>" }`. Database error details are logge
 | 400 | Malformed `year` | `Invalid year. Use YYYY or YYYY-YY, e.g. 2025 or 2025-26` |
 | 400 | Unknown `team` | `Invalid team. Use one of: UHC, Operations, RC, Community Admins, Mentors` |
 | 404 | `year` given but no members that year | `No council found for 2019-20` |
+| 404 | `year` is the current year | `2026-27 is the current council; use /api/council` |
 | 405 | Method other than `GET`/`OPTIONS` | `Method not allowed` |
 | 500 | Supabase error / not configured | `Failed to load council history` |
 
@@ -285,24 +311,23 @@ An admin edit can take up to ~10 minutes to show on the archive. That's acceptab
 
 ### 6.7 Query
 
-One round trip, grouped in application code:
+One round trip, filtered and grouped in application code:
 
 ```js
 supabase
   .from('council_members')
-  .select('id, name, position, region, team, tenure_year, profile_photo_url, linkedin')
+  .select('id, name, roll_no, position, region, team, tenure_year, profile_photo_url, linkedin')
   .order('tenure_year', { ascending: false })
-  // + .eq('tenure_year', year) when ?year is given
-  // + .in('team', [canonicalTeam]) when ?team is given
 ```
 
-`current_tenure_year` comes from the same result when unfiltered. When `year` or `team` is set, a second tiny query `select('tenure_year').order('tenure_year', { ascending: false }).limit(1)` provides it.
+The newest `tenure_year` in the result is the current year. Its rows are dropped, then the `year` and `team` filters are applied in memory. At a few hundred rows this is cheaper than a second query, and it guarantees `current_tenure_year` matches what was left out.
 
 ## 7. Changes to existing endpoints
 
 | Endpoint | Change | Why |
 |---|---|---|
 | `GET /api/council` | New optional `tenure_year` param: `current` (latest year), a year (`2025`/`2025-26`), or absent (all rows: **unchanged default**, so the admin list and dashboard keep working) | P3 |
+| `GET /api/council`, `GET /api/council/:id`, `GET /api/council/team/:team` | Return `roll_no` for everyone. Return `email` only for current-tenure members; past members get `email: null`, unless the request carries a valid admin token (the admin page needs emails to edit past members) | P8 |
 | `POST/PUT /api/council` | Validate `tenure_year` (integer, 2020–2100, required on POST) and normalise `team` to the canonical value; reject unknown teams with 400 | P4, keeps data clean after the CHECK constraint lands |
 | `POST /api/council/sync-yaml` | Only dump the current tenure | P6 |
 | Both backends | Register `/history` **before** the `/:id` route | P7 |
@@ -326,12 +351,14 @@ Env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` of the **current** project.
 For each member in each YAML section:
 
 1. Map the section to a canonical team ([§5.3](#53-canonical-teams)).
-2. Trim `name`, `position`, `region`, and the optional `linkedin`.
+2. Trim `name`, `position`, `region`, and the optional `email` and `linkedin`. The database fills in `roll_no` from `email` ([§5.4](#54-roll-number)).
 3. Get the photo from `image`, which can be a URL (as in `council-2025-26.yml`) or a file path relative to the YAML file (for newly collected councils, see [§8.3](#83-older-councils)). Upload it to the public bucket `nilgiri_media` at `Nilgiri Website/Council <YY-YY>/<slug(name)>.<ext>` with `upsert: true`, e.g. `Council 25-26`. Store the **public** URL (`/storage/v1/object/public/…`), which never expires, unlike the signed URL.
 4. Upsert the row on `(tenure_year, team, name, position)` (the unique constraint from [§5.2](#52-migration)) so re-runs update rather than duplicate.
 5. If a photo download or file read fails, insert the row with `profile_photo_url = null` and list it at the end, so nothing silently disappears.
 
-`--dry-run` prints the planned rows and uploads without writing anything. The script prints `inserted / updated / photo failures` at the end.
+`--dry-run` prints the planned rows and uploads without writing anything. The script prints `inserted / updated / photo failures / missing roll numbers` at the end.
+
+`council-2025-26.yml` has no emails, so its 24 members would end up with no roll number. Add each member's IITM email to the file before running the backfill, or add them afterwards in the admin panel. The emails are stored but never published.
 
 ### 8.3 Older councils
 
@@ -349,9 +376,11 @@ council-2024-25/
 
 ```yaml
 # council.yml for one academic year. Leave a section as [] if that team didn't exist.
+# email: IITM student email. The roll number is taken from it; the email itself is never shown publicly.
 # image: path relative to this file (or a URL). linkedin: optional.
 niligiri_uhc:
   - name: Full Name
+    email: 22f1000000@ds.study.iitm.ac.in
     position: Secretary
     region: Kolkata
     image: photos/full-name.jpg
@@ -396,10 +425,13 @@ export function normalizeCouncilTeam(team) { /* alias → key, or null */ }
 export function getOperationsSubTeam(position) { /* WebOps | PR | Multimedia */ }
 export function parseTenureYear(value) { /* '2025' | '2025-26' → 2025, else null */ }
 export function formatTenureLabel(year) { /* 2025 → '2025-26' */ }
-export function groupCouncilHistory(rows, { summary }) { /* rows → tenures[] per §6.2 */ }
+export function groupCouncilHistory(rows, { summary }) { /* rows → past tenures[] per §6.2 */ }
+export function redactPastEmails(rows, currentYear, { isAdmin }) { /* email → null where tenure_year < currentYear, unless isAdmin */ }
 ```
 
 `groupCouncilHistory` is a pure function holding all the grouping and sorting, so both handlers stay thin and it can be unit-tested without a database.
+
+`redactPastEmails` is used by the three public council GETs ([§7](#7-changes-to-existing-endpoints)). `isAdmin` comes from a **non-failing** version of the existing token check: a missing or invalid token means "not admin" rather than a 401, because these GETs stay public. On Vercel this is `authenticateRequest` in `api/_handlers/utils/auth.ts`, which already returns `null` instead of failing; on Express it is a small `optionalAuth` middleware next to `authenticateToken` in `backend/middleware/auth.js`.
 
 ### 9.2 Vercel (`api/`)
 
@@ -429,7 +461,11 @@ export function groupCouncilHistory(rows, { summary }) { /* rows → tenures[] p
 ## 11. Security and privacy
 
 - **Read-only and public:** no auth, no writes. Inputs are an allowlisted `team` and a regex-validated `year`, passed through the Supabase query builder (parameterised, so no injection surface).
-- **Column allowlist:** `email` is never selected. The current `/api/council` returns emails publicly; this design does not change that endpoint's output, but it is worth a separate decision.
+- **Emails** (decided 2026-10-25):
+  - The history never selects `email`.
+  - On `/api/council`, `/:id` and `/team/:team`, past members' emails go only to authenticated admins; everyone else gets `roll_no`.
+  - Current members' emails stay public, as today.
+  - `roll_no` is only derived from IITM student addresses ([§5.4](#54-roll-number)), so personal addresses never leak through it.
 - **Consent:** the history publishes names, photos and LinkedIn profiles of former students indefinitely. The council has agreed to this (2026-10-25). If a former member asks to be removed, use a normal admin delete (or clearing `linkedin`/`profile_photo_url`), and it reaches the archive within the cache window.
 - **Errors:** generic messages; Supabase details stay in server logs.
 - **Abuse:** CDN caching on Vercel; `express-rate-limit` on Express.
@@ -461,8 +497,9 @@ The order matters: past members must not reach the table before the current coun
    - `tenure_year` filter on `/api/council`
    - write validation on `POST/PUT /api/council`
    - current-tenure-only `sync-yaml`
+   - past-member email redaction on the public council GETs
    - `Council.jsx` changes ([§15](#15-frontend-changes))
-4. **Backfill 2025-26:** `--dry-run`, review, then run for real. **Before 2027-01-19.**
+4. **Backfill 2025-26:** add members' IITM emails to the YAML (for roll numbers), run with `--dry-run`, review, then run for real. **Before 2027-01-19.**
 5. **Verify:**
    - `/council/archive` shows 2025-26 with photos loading from the current project's public URLs.
    - `/council` still shows only 2026-27.
@@ -475,13 +512,15 @@ The order matters: past members must not reach the table before the current coun
 
 - **`src/components/Council.jsx`, archive mode:**
   - Replace `COUNCIL_ARCHIVE_YEARS` and the YAML fetch with one `GET /council/history`.
-  - Build the year selector from `tenures`, defaulting to the most recent **past** tenure, with the current one labelled "(current)".
+  - Build the year selector from `tenures` (past years only), defaulting to the most recent. If `tenures` is empty, show the existing empty state.
   - Use each member's `team`/`sub_team` from the response instead of `flattenYamlCouncilData`.
 - **`Council.jsx`, current mode:** call `/council` with `params: { tenure_year: 'current' }`. Drop the ignored `limit=20`.
 - **`src/pages/admin/AdminCouncil.jsx`:**
   - Team select uses the canonical list.
   - Tenure year becomes a number input (or a select of recent years) showing the `2025-26` label.
   - Add a year filter to the member list so past councils don't crowd the current one.
+  - Show `roll_no` read-only next to the email field; it fills in after saving.
+- **Archive cards:** can show `roll_no` under the role. Cards show only name and role today, so this is optional.
 - **`src/pages/admin/Dashboard.jsx`:** count the current tenure only.
 
 ## 16. Testing plan
@@ -497,16 +536,19 @@ The repo has no test runner. Keep it lightweight:
 - **Manual checks** against a preview deployment:
 
   ```bash
-  curl -s $BASE/api/council/history | jq '.tenures[] | {label, is_current, member_count}'
+  curl -s $BASE/api/council/history | jq '{current_tenure_year, past: [.tenures[] | {label, member_count}]}'
   curl -s "$BASE/api/council/history?year=2025-26&team=uhc" | jq '.tenures[0].teams[0].members[].position'
   curl -s "$BASE/api/council/history?summary=true" | jq
   curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/council/history?year=2025-27"   # 400
   curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/council/history?year=2019"      # 404
+  curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/council/history?year=2026-27"   # 404 while 2026-27 is current
+  curl -s $BASE/api/council | jq '[.[] | select(.tenure_year < 2026 and .email != null)] | length'   # 0 without a token
   curl -sI "$BASE/api/council/history" | grep -i cache-control
   curl -s $BASE/api/council/history | jq '[.. | objects | select(has("email"))] | length'   # 0
   ```
 
-- **Backfill:** run with `--dry-run` first; afterwards check that `SELECT team, count(*) FROM council_members WHERE tenure_year = 2025 GROUP BY team` gives UHC 3, Operations 7, RC 5, Mentors 3, Community Admins 6, and that every `profile_photo_url` is a `/object/public/` URL.
+- **Backfill:** run with `--dry-run` first; afterwards check that `SELECT team, count(*) FROM council_members WHERE tenure_year = 2025 GROUP BY team` gives UHC 3, Operations 7, RC 5, Mentors 3, Community Admins 6, and that every `profile_photo_url` is a `/object/public/` URL. Every member whose email was provided should have a `roll_no`.
+- **Roll number:** after the migration, insert and roll back test rows covering each case in the [§5.4](#54-roll-number) table, and check `roll_no`.
 
 ## 17. Open questions
 
@@ -516,27 +558,31 @@ The repo has no test runner. Keep it lightweight:
 - **Earlier councils:** there were councils before 2025-26. Their rosters and photos are being collected in the format from [§8.3](#83-older-councils). (Answered 2026-10-25.)
 - **Consent:** the council is fine with publishing former members' names, photos and LinkedIn links indefinitely. (Answered 2026-10-25.)
 
+- **Archive scope:** past years only. The history endpoint excludes the current year, and `/council/archive` no longer lists it. (Decided 2026-10-25.)
+- **Emails:** past members are shown with a roll number, never an email. `roll_no` is stored for every member as a field resolved from the email (the part before `@`). Current members keep their public email. (Decided 2026-10-25; see [§5.4](#54-roll-number) and [§7](#7-changes-to-existing-endpoints).)
+
 ### Still open
 
-1. **Archive scope:** should `/council/archive` list the current year too (as today), or past years only?
-2. **Email on `/api/council`:** should the existing endpoint stop returning member emails publicly? It's out of scope here, but the same concern applies.
+None.
 
 ## 18. File checklist
 
 | File | Change |
 |---|---|
 | `supabase/migrations/008_council_history.sql` | New ([§5](#5-data-model-changes)) |
-| `api/_handlers/utils/councilTeams.ts` | New helpers |
+| `api/_handlers/utils/councilTeams.ts` | New helpers, including `redactPastEmails` |
 | `backend/utils/councilTeams.js` | New helpers (mirror) |
 | `backend/utils/councilTeams.test.js` | New unit tests |
 | `api/_handlers/council/history.ts` | New handler |
 | `api/index.ts` | Route `/api/council/history` above the `[id]` match |
-| `api/_handlers/council/index.ts` | `tenure_year` filter; POST validation |
-| `api/_handlers/council/[id].ts` | PUT validation |
+| `api/_handlers/council/index.ts` | `tenure_year` filter; past-member email redaction; POST validation |
+| `api/_handlers/council/[id].ts` | Past-member email redaction on GET; PUT validation |
 | `api/_handlers/council/sync-yaml.ts` | Current tenure only |
-| `backend/routes/council.js` | `GET /history` before `/:id`; `tenure_year` filter; POST/PUT validation; `sync-yaml` filter |
+| `api/_handlers/council/team.ts` | Past-member email redaction |
+| `backend/middleware/auth.js` | `optionalAuth` middleware |
+| `backend/routes/council.js` | `GET /history` before `/:id`; `tenure_year` filter; past-member email redaction on public GETs; POST/PUT validation; `sync-yaml` filter |
 | `backend/scripts/backfill-council-history.js` | New one-off backfill ([§8](#8-backfilling-2025-26)) |
 | `src/components/Council.jsx` | Archive via history endpoint; current via `tenure_year=current` |
-| `src/pages/admin/AdminCouncil.jsx` | Canonical teams, numeric year, year filter |
+| `src/pages/admin/AdminCouncil.jsx` | Canonical teams, numeric year, year filter, read-only `roll_no` |
 | `src/pages/admin/Dashboard.jsx` | Count current tenure |
 | `public/council-2025-26.yml`, `public/council-2026-27.yml` | Delete after backfill is verified (follow-up) |
