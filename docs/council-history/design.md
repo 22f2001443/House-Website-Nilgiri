@@ -65,7 +65,9 @@ Add a public, read-only endpoint that returns every House Council Nilgiri has ha
 
 ## 4. Design overview
 
-**`council_members` + `tenure_year` is the history.** Each row is one person's term in one academic year. `tenure_year` is the first calendar year of the academic year (`2025` = 2025-26; this matches how `sync-yaml` already formats `tenure`). The current council is the latest `tenure_year` present.
+**`council_members` + `tenure_year` is the history.** Each row is one person's term in one academic year. `tenure_year` is the first calendar year of the academic year (`2025` = 2025-26; this matches how `sync-yaml` already formats `tenure`). The current council is the latest `tenure_year` present, even if the next council is entered before the handover (decided; see [§17](#17-open-questions)).
+
+> **Admin rule that follows from this:** as soon as any member with a newer `tenure_year` is saved, `/council` switches to that year and the outgoing council moves to the archive. Enter the next council when it should go public, ideally all at once, because a partly entered council is shown as it is.
 
 ```
                     ┌────────────────────────────────────────────┐
@@ -324,16 +326,49 @@ Env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` of the **current** project.
 For each member in each YAML section:
 
 1. Map the section to a canonical team ([§5.3](#53-canonical-teams)).
-2. Trim `name`, `position`, `region`.
-3. Download `image`. Upload it to the public bucket `nilgiri_media` at `Nilgiri Website/Council 25-26/<slug(name)>.<ext>` with `upsert: true`. Store the **public** URL (`/storage/v1/object/public/…`), which never expires, unlike the signed URL.
+2. Trim `name`, `position`, `region`, and the optional `linkedin`.
+3. Get the photo from `image`, which can be a URL (as in `council-2025-26.yml`) or a file path relative to the YAML file (for newly collected councils, see [§8.3](#83-older-councils)). Upload it to the public bucket `nilgiri_media` at `Nilgiri Website/Council <YY-YY>/<slug(name)>.<ext>` with `upsert: true`, e.g. `Council 25-26`. Store the **public** URL (`/storage/v1/object/public/…`), which never expires, unlike the signed URL.
 4. Upsert the row on `(tenure_year, team, name, position)` (the unique constraint from [§5.2](#52-migration)) so re-runs update rather than duplicate.
-5. If a photo download fails, insert the row with `profile_photo_url = null` and list it at the end, so nothing silently disappears.
+5. If a photo download or file read fails, insert the row with `profile_photo_url = null` and list it at the end, so nothing silently disappears.
 
 `--dry-run` prints the planned rows and uploads without writing anything. The script prints `inserted / updated / photo failures` at the end.
 
 ### 8.3 Older councils
 
-Nothing earlier than 2025-26 exists in the repository. Once the endpoint is live, earlier councils need nothing extra: an admin adds the members with the right `tenure_year` and they appear in the history automatically. If someone has older rosters as YAML in the same format, the same script handles them (`--year 2024`, …).
+There were councils before 2025-26. Their rosters and photos are being collected (as of 2026-10-25). Nothing about the endpoint depends on them: each year appears in the history as soon as its rows exist.
+
+To make the collected data loadable with the same script, collect **one folder per academic year** in the same format as `council-2025-26.yml`:
+
+```
+council-2024-25/
+├── council.yml
+└── photos/
+    ├── full-name.jpg
+    └── …
+```
+
+```yaml
+# council.yml for one academic year. Leave a section as [] if that team didn't exist.
+# image: path relative to this file (or a URL). linkedin: optional.
+niligiri_uhc:
+  - name: Full Name
+    position: Secretary
+    region: Kolkata
+    image: photos/full-name.jpg
+    linkedin: https://www.linkedin.com/in/…
+operations: []
+regional_coordinators: []
+mentors: []
+community_admins: []
+```
+
+- **Photos:** jpg, png or webp, at least 400×400, cropped like the current council cards.
+- **Positions:** write them the way they were used that year (`Secretary`, `Deputy Secretary`, `Web-Admin`, `Delhi RC`, …). Leadership sorting and the Operations sub-team are derived from this text ([§5.3](#53-canonical-teams)).
+- **Teams that didn't exist yet:** if a year had a team that doesn't fit the five sections, flag it before loading rather than forcing it into one. It may need a new canonical team.
+- **Keep the folders out of `public/`:** anything in `public/` is served by the site as soon as it's deployed. Run the script from wherever the folder lives: `node scripts/backfill-council-history.js --file /path/to/council-2024-25/council.yml --year 2024`.
+- **Earliest year:** migration `008` only allows `tenure_year` from 2020. If the collected history starts earlier, lower that bound before running the migration.
+
+An admin can also enter a small year by hand in the admin panel, with the right `tenure_year`.
 
 ### 8.4 Deadline
 
@@ -395,14 +430,14 @@ export function groupCouncilHistory(rows, { summary }) { /* rows → tenures[] p
 
 - **Read-only and public:** no auth, no writes. Inputs are an allowlisted `team` and a regex-validated `year`, passed through the Supabase query builder (parameterised, so no injection surface).
 - **Column allowlist:** `email` is never selected. The current `/api/council` returns emails publicly; this design does not change that endpoint's output, but it is worth a separate decision.
-- **Consent:** the history publishes names, photos and LinkedIn profiles of former students indefinitely. The council should agree that this is fine. Removal is a normal admin delete (or clearing `linkedin`/`profile_photo_url`), and it reaches the archive within the cache window.
+- **Consent:** the history publishes names, photos and LinkedIn profiles of former students indefinitely. The council has agreed to this (2026-10-25). If a former member asks to be removed, use a normal admin delete (or clearing `linkedin`/`profile_photo_url`), and it reaches the archive within the cache window.
 - **Errors:** generic messages; Supabase details stay in server logs.
 - **Abuse:** CDN caching on Vercel; `express-rate-limit` on Express.
 
 ## 12. Future work
 
 - **Person timeline:** add a nullable `person_id` (or a stable slug) to link one person's rows across years, enabling "terms served" and role-holder lists (every Secretary since 2025).
-- **Tenure metadata:** a small `council_tenures (tenure_year PK, starts_on, ends_on, notes)` table, if handover dates or year notes are wanted. It would also replace "latest year = current" with an explicit flag.
+- **Tenure metadata:** a small `council_tenures (tenure_year PK, starts_on, ends_on, notes)` table, if handover dates or year notes are wanted. It is not needed to decide the current council: the newest year is current by decision ([§17](#17-open-questions)).
 - **`sub_team` column:** if the position-text heuristic for Operations proves fragile, store it explicitly.
 - **Retire YAML fallbacks:** once `/api/council?tenure_year=current` has been reliable for a term, remove the `public-data/council-data.yml` fallback and `sync-yaml`.
 
@@ -431,7 +466,8 @@ The order matters: past members must not reach the table before the current coun
 5. **Verify:**
    - `/council/archive` shows 2025-26 with photos loading from the current project's public URLs.
    - `/council` still shows only 2026-27.
-6. **Clean up** in a follow-up PR: delete `public/council-2025-26.yml` and `public/council-2026-27.yml` (they stay in git history) and the archive-mode YAML code path.
+6. **Older councils:** as each year's folder is ready ([§8.3](#83-older-councils)), run the script with `--dry-run`, review, then for real. There's no deadline for these.
+7. **Clean up** in a follow-up PR: delete `public/council-2025-26.yml` and `public/council-2026-27.yml` (they stay in git history) and the archive-mode YAML code path.
 
 **Rollback:** the endpoint is additive, so reverting the deploy is safe. The migration's data changes (trimming, team renames) are not reversed. The old frontend (`normalizeTeam`) and the Vercel `sync-yaml` handle the canonical values (`Operations`, `Mentors`, `Community Admins`). The old **Express** `sync-yaml` only recognises `Mentor`, so after a rollback it would leave `Mentors` out of its YAML. Backfilled rows can be removed with `DELETE FROM council_members WHERE tenure_year = 2025`.
 
@@ -474,11 +510,16 @@ The repo has no test runner. Keep it lightweight:
 
 ## 17. Open questions
 
-1. **Which year is "current"?** This design uses the latest `tenure_year` present. If next year's council is entered before handover, it becomes current immediately. Is that acceptable, or should "current" be an explicit setting (env var, or the `council_tenures` table in [§12](#12-future-work))?
-2. **Earlier councils:** were there councils before 2025-26, and does anyone have the rosters and photos?
-3. **Consent:** is the council comfortable publishing former members' names, photos and LinkedIn links indefinitely?
-4. **Archive scope:** should `/council/archive` list the current year too (as today), or past years only?
-5. **Email on `/api/council`:** should the existing endpoint stop returning member emails publicly? It's out of scope here, but the same concern applies.
+### Decided
+
+- **Which year is "current"?** The newest `tenure_year` present, even if next year's council is entered before the handover. No env var or `council_tenures` table is needed for this. (Decided 2026-10-25.)
+- **Earlier councils:** there were councils before 2025-26. Their rosters and photos are being collected in the format from [§8.3](#83-older-councils). (Answered 2026-10-25.)
+- **Consent:** the council is fine with publishing former members' names, photos and LinkedIn links indefinitely. (Answered 2026-10-25.)
+
+### Still open
+
+1. **Archive scope:** should `/council/archive` list the current year too (as today), or past years only?
+2. **Email on `/api/council`:** should the existing endpoint stop returning member emails publicly? It's out of scope here, but the same concern applies.
 
 ## 18. File checklist
 
