@@ -62,6 +62,8 @@ const ImportantContactsPage = () => {
         <div className="resources-container">
           {Object.entries(categorizedContacts)
             .sort(([roleA], [roleB]) => {
+              // UHC always comes first
+              if ((roleA === 'UHC') !== (roleB === 'UHC')) return roleA === 'UHC' ? -1 : 1;
               const priorityDiff = getLeadershipPriority(roleA) - getLeadershipPriority(roleB);
               if (priorityDiff !== 0) return priorityDiff;
               return roleA.localeCompare(roleB);
